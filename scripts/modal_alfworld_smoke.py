@@ -26,25 +26,42 @@ alfworld_image = (
         "pyyaml",
     )
     .env({"ALFWORLD_DATA": "/root/alfworld_data"})
-    .run_commands("alfworld-download -f")
+    .run_commands(
+        "alfworld-download -f",
+        "git clone --depth 1 https://github.com/alfworld/alfworld.git /tmp/alfworld_repo",
+        "mkdir -p /root/alfworld_data/configs",
+        "cp /tmp/alfworld_repo/configs/base_config.yaml /root/alfworld_data/configs/base_config.yaml",
+    )
 )
+
+
+def _find_base_config() -> str:
+    import os
+
+    import alfworld
+
+    pkg_dir = os.path.dirname(alfworld.__file__)
+    search_roots = [pkg_dir, os.path.dirname(pkg_dir), os.environ.get("ALFWORLD_DATA", "")]
+    for root in search_roots:
+        if not root:
+            continue
+        for dirpath, _, files in os.walk(root):
+            if "base_config.yaml" in files:
+                return os.path.join(dirpath, "base_config.yaml")
+    raise FileNotFoundError(f"base_config.yaml not found under {search_roots}")
 
 
 @app.function(image=alfworld_image, timeout=600)
 def test_alfworld() -> dict:
-    import os
-
-    import alfworld.agents.environment as environment
     import yaml
+    from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
 
-    config_path = f"{os.environ['ALFWORLD_DATA']}/configs/base_config.yaml"
+    config_path = _find_base_config()
+    print(f"found config at: {config_path}")
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
-    env_type = config["env"]["type"]
-    print(f"env type from config: {env_type}")
-
-    env = getattr(environment, env_type)(config, train_eval="eval_out_of_distribution")
+    env = AlfredTWEnv(config, train_eval="eval_out_of_distribution")
     env = env.init_env(batch_size=1)
 
     obs, info = env.reset()
@@ -67,7 +84,7 @@ def test_alfworld() -> dict:
     print(f"score={scores[0]}, done={dones[0]}")
 
     return {
-        "env_type": env_type,
+        "env_type": "AlfredTWEnv",
         "n_admissible_commands": len(admissible),
         "first_action": first_action,
         "score_after_step": scores[0],
