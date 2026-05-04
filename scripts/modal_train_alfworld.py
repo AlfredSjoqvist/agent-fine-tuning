@@ -47,12 +47,12 @@ training_image = (
         "ALFWORLD_TRAJECTORY_DUMP_DIR": "/output/trajectories",
     })
     .add_local_dir(
-        "c:/Users/Alfred/Desktop/project-cs224r",
+        "/Users/hana/Desktop/224project",
         remote_path="/root/project",
     )
 )
 
-volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
+volume = modal.Volume.from_name("224project-data", create_if_missing=True)
 
 
 @app.function(
@@ -102,7 +102,7 @@ def train_test() -> dict:
         "algorithm.use_kl_in_reward=False",
         "trainer.critic_warmup=0",
         'trainer.logger=["console"]',
-        "trainer.project_name=cs224r-interface-rl",
+        "trainer.project_name=224project-alfworld",
         "trainer.experiment_name=alfworld_learning_v2_qwen3b",
         "trainer.n_gpus_per_node=1",
         "trainer.nnodes=1",

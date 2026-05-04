@@ -34,7 +34,7 @@ image = (
     )
 )
 
-volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
+volume = modal.Volume.from_name("224project-data", create_if_missing=True)
 
 
 SYSTEM_PROMPT = (

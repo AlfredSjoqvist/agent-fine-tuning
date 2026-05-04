@@ -3,7 +3,7 @@
 Confirms:
   - Container image builds with torch
   - GPU is visible to the container
-  - Persistent volume `cs224r-interface-rl` mounts and accepts writes
+  - Persistent volume `224project-data` mounts and accepts writes
 
 Run from project root:
     modal run scripts/modal_smoke_test.py
@@ -18,7 +18,7 @@ app = modal.App("cs224r-smoke-test")
 
 image = modal.Image.debian_slim(python_version="3.11").pip_install("torch==2.4.1")
 
-volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
+volume = modal.Volume.from_name("224project-data", create_if_missing=True)
 
 
 @app.function(
