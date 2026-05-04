@@ -1,11 +1,11 @@
-"""Build a parquet of ALFWorld tasks for verl multi-turn GRPO training.
+"""Build paper-faithful train + val parquets for ALFWorld GRPO training.
 
-Runs inside a Modal container with ALFWorld installed. For each of N games we:
-  - Reset AlfredTWEnv
-  - Capture the initial English observation (the task prompt)
-  - Emit a parquet row in verl's expected schema
+Train data is sampled from ALFWorld's `train` split (~3,300 games, all 6 task types).
+Val data is sampled from `valid_unseen` (134 held-out games).
+Each parquet row carries `interaction_kwargs.split` so the verl Interaction loads
+the correct env per rollout.
 
-Writes train.parquet and val.parquet to the persistent volume.
+System prompt teaches the ReAct paradigm (Thought + Action), matching Xi et al. (2026).
 
 Run:
     PYTHONIOENCODING=utf-8 PYTHONUTF8=1 modal run scripts/prepare_alfworld_data.py
@@ -36,27 +36,19 @@ image = (
 
 volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
 
+
 SYSTEM_PROMPT = (
-    "You are an expert agent operating in the ALFWorld text-based household "
-    "simulator. Each turn you see a room description and a list of valid actions. "
-    "Respond with a single action on a line prefixed 'Action:'. "
-    "Example: 'Action: go to fridge 1'. Do not output anything else on that line."
+    "You are an expert agent in the ALFWorld text-based household simulator. "
+    "Each turn, you see a room observation and a list of valid actions. "
+    "First reason briefly about what to do, then issue exactly one action.\n\n"
+    "Format every response as:\n"
+    "Thought: <1-2 sentences of planning>\n"
+    "Action: <one command, copied verbatim from the valid actions list>\n\n"
+    "Example:\n"
+    "Thought: I need to find a peppershaker. Those are usually in cabinets "
+    "or drawers. Let me check drawer 1 first.\n"
+    "Action: go to drawer 1"
 )
-
-
-_HARD_TASK_KEYWORDS = ("heat", "cool", "clean", "examine")
-
-
-def _is_pick_and_place(task_desc: str) -> bool:
-    """Pick & Place (type 1) tasks contain 'put' but NOT heat/cool/clean/examine verbs."""
-    t = task_desc.lower()
-    if "put" not in t:
-        return False
-    if any(k in t for k in _HARD_TASK_KEYWORDS):
-        return False
-    if "two" in t:  # type 6 = Pick Two & Place, harder
-        return False
-    return True
 
 
 def _extract_task_from_obs(obs: str) -> str:
@@ -66,53 +58,58 @@ def _extract_task_from_obs(obs: str) -> str:
     return ""
 
 
-@app.function(image=image, volumes={"/output": volume}, timeout=1200)
-def build_dataset(
-    n_train: int = 4,
-    n_val: int = 30,
-    max_turns: int = 30,
-    max_reset_attempts: int = 134,
-    output_subdir: str = "alfworld_pnp",
-) -> dict:
-    import os
+def _format_initial_user(obs: str, admissible: list[str], max_turns: int) -> str:
+    return (
+        f"{obs}\n"
+        f"Valid actions ({len(admissible)}): {', '.join(admissible)}\n"
+        f"[turn 0/{max_turns}] Now respond with `Thought:` followed by `Action:`."
+    )
 
-    import pandas as pd
-    import yaml
+
+def _build_split_rows(cfg, split: str, n_target: int, max_turns: int) -> list[dict]:
+    """Reset env n_target times on a given split, capture initial obs+task per game.
+
+    Each row gets game_index = position in the SORTED game_files list, so
+    the Interaction's pinning logic (cycle reset N+1 times on the same sorted
+    list) lands on the same game during training.
+    """
     from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
 
-    with open("/root/alfworld_data/configs/base_config.yaml") as f:
-        cfg = yaml.safe_load(f)
-
-    env = AlfredTWEnv(cfg, train_eval="eval_out_of_distribution")
-    # Sort for deterministic index -> game mapping across processes.
-    # Must sort BEFORE init_env (which freezes order via textworld.gym.register_games).
+    env = AlfredTWEnv(cfg, train_eval=split)
+    # Determinism across processes: sort before init_env (which freezes order).
     env.game_files.sort()
-    print(f"First 3 game files (sorted): {env.game_files[:3]}")
-    batched = env.init_env(batch_size=1)
+    n_total = len(env.game_files)
+    target = n_total if n_target < 0 else min(n_target, n_total)
+    print(f"[{split}] {n_total} games available, building {target} rows")
+    print(f"[{split}] first game: {env.game_files[0]}")
 
+    batched = env.init_env(batch_size=1)
     rows: list[dict] = []
-    skipped_by_type: dict[str, int] = {}
-    target = n_train + n_val
-    for i in range(max_reset_attempts):
-        if len(rows) >= target:
-            break
+    task_type_counts: dict[str, int] = {}
+    for i in range(target):
         obs, info = batched.reset()
         admissible = info.get("admissible_commands", [[]])[0]
         task_desc = _extract_task_from_obs(obs[0])
-        if not _is_pick_and_place(task_desc):
-            hard_hit = next((k for k in _HARD_TASK_KEYWORDS if k in task_desc), "other")
-            skipped_by_type[hard_hit] = skipped_by_type.get(hard_hit, 0) + 1
-            continue
 
-        initial_user = (
-            f"{obs[0]}\n"
-            f"Valid actions ({len(admissible)}): {', '.join(admissible)}\n"
-            f"[turn 0/{max_turns}] Reply with exactly 'Action: <command>' "
-            f"where <command> is copied verbatim from the valid actions list."
-        )
+        # Loose task-type tagging for stats (not filtering anymore)
+        if "heat" in task_desc or "hot" in task_desc:
+            t = "heat"
+        elif "cool" in task_desc or "cold" in task_desc:
+            t = "cool"
+        elif "clean" in task_desc:
+            t = "clean"
+        elif "examine" in task_desc or "desklamp" in task_desc:
+            t = "examine"
+        elif "two" in task_desc:
+            t = "pick_two"
+        elif "put" in task_desc:
+            t = "pick_place"
+        else:
+            t = "other"
+        task_type_counts[t] = task_type_counts.get(t, 0) + 1
 
-        row_idx = len(rows)
-        row = {
+        initial_user = _format_initial_user(obs[0], admissible, max_turns)
+        rows.append({
             "data_source": "alfworld",
             "prompt": [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -121,42 +118,63 @@ def build_dataset(
             "ability": "agentic",
             "reward_model": {"style": "rule", "ground_truth": "task_success"},
             "extra_info": {
-                "split": "train" if row_idx < n_train else "val",
-                "index": row_idx,
+                "split_role": "train" if split == "train" else "val",
+                "alfworld_split": split,
+                "index": i,
                 "game_index": i,
                 "task_desc": task_desc,
                 "interaction_kwargs": {
                     "name": "alfworld",
                     "game_index": i,
                     "task": task_desc,
+                    "split": split,
                 },
             },
-        }
-        rows.append(row)
+        })
 
-    df_all = pd.DataFrame(rows)
-    df_train = df_all.iloc[:n_train].reset_index(drop=True)
-    df_val = df_all.iloc[n_train:].reset_index(drop=True)
+    print(f"[{split}] task type breakdown: {task_type_counts}")
+    return rows
+
+
+@app.function(image=image, volumes={"/output": volume}, timeout=3600)
+def build_dataset(
+    n_train: int = -1,        # -1 = use all train-split games
+    n_val: int = 134,         # 134 = all valid_unseen games
+    max_turns: int = 30,
+    output_subdir: str = "alfworld_paper_faithful",
+) -> dict:
+    import os
+
+    import pandas as pd
+    import yaml
+
+    with open("/root/alfworld_data/configs/base_config.yaml") as f:
+        cfg = yaml.safe_load(f)
+
+    print("\n=== Building TRAIN parquet from `train` split ===")
+    train_rows = _build_split_rows(cfg, split="train", n_target=n_train, max_turns=max_turns)
+
+    print("\n=== Building VAL parquet from `eval_out_of_distribution` (valid_unseen) ===")
+    val_rows = _build_split_rows(cfg, split="eval_out_of_distribution", n_target=n_val, max_turns=max_turns)
 
     out_dir = f"/output/data/{output_subdir}"
     os.makedirs(out_dir, exist_ok=True)
     train_path = f"{out_dir}/train.parquet"
     val_path = f"{out_dir}/val.parquet"
-    df_train.to_parquet(train_path, index=False)
-    df_val.to_parquet(val_path, index=False)
+    pd.DataFrame(train_rows).to_parquet(train_path, index=False)
+    pd.DataFrame(val_rows).to_parquet(val_path, index=False)
 
     volume.commit()
 
-    print(f"wrote {len(df_train)} train rows -> {train_path}")
-    print(f"wrote {len(df_val)} val rows -> {val_path}")
-    print(f"\nskipped by type (non-Pick&Place): {skipped_by_type}")
-    print(f"\nfirst 5 kept task descriptions:")
-    for r in rows[:5]:
+    print(f"\nwrote {len(train_rows)} train rows -> {train_path}")
+    print(f"wrote {len(val_rows)} val rows -> {val_path}")
+    print("\nfirst 3 train task descriptions:")
+    for r in train_rows[:3]:
         print(f"  - game_index={r['extra_info']['game_index']}: {r['extra_info']['task_desc']}")
 
     return {
-        "n_train": len(df_train),
-        "n_val": len(df_val),
+        "n_train": len(train_rows),
+        "n_val": len(val_rows),
         "train_path": train_path,
         "val_path": val_path,
     }
