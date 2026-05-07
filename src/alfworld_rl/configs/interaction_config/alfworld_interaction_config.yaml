@@ -4,3 +4,7 @@ interaction:
     config:
       split: "eval_out_of_distribution"
       max_turns: 30
+      # Option F (L_init): show admissible-actions list only at reset (initial user
+      # prompt built by data-prep), NOT in per-turn observations. Matches Xi et al.'s
+      # AgentGym ALFWorld prompt format. Set True for L_per_step ablation.
+      show_action_list_per_turn: False

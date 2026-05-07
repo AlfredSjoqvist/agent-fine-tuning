@@ -1,0 +1,11 @@
+interaction:
+  - name: "babyai"
+    class_name: "babyai_rl.babyai_interaction.BabyAIInteraction"
+    config:
+      default_game_name: "BabyAI-GoToRedBall-v0"
+      max_turns: 30
+      max_episode_steps: 50
+      # Show action list every turn (BabyAI default — list_per_step is the
+      # condition Xi attributes the negative-transfer effect to). Set False
+      # for the L_init ablation arm later.
+      show_action_list_per_turn: True
