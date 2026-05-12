@@ -66,15 +66,26 @@ volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
     timeout=86400,  # 24hr — runtime estimates have been wrong every time
     memory=131072,
 )
-def train_test() -> dict:
+def train_test(condition: str = "per_step", total_steps: int = 1, seed: int = 0) -> dict:
+    """Run a single GRPO training session.
+
+    Args:
+        condition: one of "per_step", "shuffled", "examples".
+                   Selects the parquet path AND the interaction config YAML.
+        total_steps: number of GRPO training steps.
+        seed: random seed for trainer; included in run_id and experiment_name so
+              concurrent runs don't collide on volume paths.
+    """
     import json
     import os
     import subprocess
     import time
 
+    assert condition in ("per_step", "shuffled", "examples"), f"unknown condition {condition}"
+
     os.chdir("/opt/verl")
 
-    run_id = f"babyai_smoke_v1_{int(time.time())}"
+    run_id = f"babyai_phase1_{condition}_seed{seed}_steps{total_steps}_{int(time.time())}"
     manifest_dir = f"/output/runs/{run_id}"
     os.makedirs(manifest_dir, exist_ok=True)
     log_path = f"{manifest_dir}/stdout.log"
@@ -123,18 +134,20 @@ def train_test() -> dict:
         "trainer.critic_warmup=0",
         'trainer.logger=["console","tensorboard"]',
         "trainer.project_name=cs224r-interface-rl",
-        "trainer.experiment_name=babyai_smoke_v1",
+        f"trainer.experiment_name=babyai_phase1_{condition}_seed{seed}",
         "trainer.n_gpus_per_node=8",
         "trainer.nnodes=1",
         "trainer.val_before_train=False",
-        "trainer.save_freq=1",
+        # save_freq=5 so we get checkpoints every 5 steps for the dynamics
+        # analysis; harmless for short smokes (still saves at the end).
+        "trainer.save_freq=5",
         "trainer.test_freq=-1",
         "trainer.total_epochs=100",
-        "trainer.total_training_steps=1",
-        "trainer.default_local_dir=/output/ckpts/babyai_smoke_v1",
-        "data.train_files=/output/data/babyai_v1/train.parquet",
-        "data.val_files=/output/data/babyai_v1/val.parquet",
-        "actor_rollout_ref.rollout.multi_turn.interaction_config_path=/root/project/src/babyai_rl/configs/interaction_config/babyai_interaction_config.yaml",
+        f"trainer.total_training_steps={total_steps}",
+        f"trainer.default_local_dir=/output/ckpts/{run_id}",
+        f"data.train_files=/output/data/babyai_phase1_v1/{condition}/train.parquet",
+        f"data.val_files=/output/data/babyai_phase1_v1/{condition}/val.parquet",
+        f"actor_rollout_ref.rollout.multi_turn.interaction_config_path=/root/project/src/babyai_rl/configs/interaction_config/babyai_interaction_{condition}.yaml",
         "custom_reward_function.path=/root/project/src/babyai_rl/reward.py",
         "custom_reward_function.name=compute_score",
     ]
@@ -188,5 +201,25 @@ def train_test() -> dict:
 
 @app.local_entrypoint()
 def main():
-    result = train_test.remote()
-    print("\ntraining result:", result)
+    """Phase 1 gating smoke: 3 conditions × 20 steps × 1 seed, parallel.
+
+    Modal will queue the spawns if 8-GPU containers are not all available
+    simultaneously; each completes independently.
+    """
+    CONDITIONS = ("per_step", "shuffled", "examples")
+    STEPS = 20
+    SEED = 0
+    print(f"=== launching Phase 1 gating ({len(CONDITIONS)} conditions × {STEPS} steps × 1 seed) ===")
+    handles = []
+    for cond in CONDITIONS:
+        h = train_test.spawn(condition=cond, total_steps=STEPS, seed=SEED)
+        print(f"  spawned {cond}: {h}")
+        handles.append((cond, h))
+
+    print("\n=== awaiting runs ===")
+    for cond, h in handles:
+        try:
+            r = h.get()
+            print(f"  [{cond}] done: {r}")
+        except Exception as e:
+            print(f"  [{cond}] FAILED: {e}")

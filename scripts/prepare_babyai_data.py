@@ -55,11 +55,9 @@ image = (
 volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
 
 
-# Verbatim AgentGym BabyAI system prompt (Xi et al. setup).
-# Source: WooooDyy/AgentGym agentenv/agentenv/envs/babyai.py.
-# Identical across L_per_step and L_none conditions: schema-level affordance
-# information ("you can do <go to>, <pick up>, ..."), no per-instance list.
-SYSTEM_PROMPT = (
+# Base system prompt — schema-level affordance info only.
+# Used by L_per_step and L_shuffled. L_examples appends EXAMPLES_BLOCK.
+SYSTEM_PROMPT_BASE = (
     "You are an exploration master that wants to finish every goal you are given. "
     "Every round I will give you an observation, and you have to respond an action "
     "and your thought based on the observation to finish the given task. You are "
@@ -70,12 +68,41 @@ SYSTEM_PROMPT = (
     "- move forward\n"
     "- go to <obj> <id>\n"
     "- pick up <obj> <id>\n"
+    "- drop\n"
     "- go through <door> <id>: <door> must be an open door.\n"
     "- toggle and go through <door> <id>: <door> can be a closed door or a locked door. "
     "If you want to open a locked door, you need to carry a key that is of the same color "
     "as the locked door.\n"
     "- toggle: there is a special case that you can just toggle, e.g. when you need to "
     "open a box.\n\n"
+)
+
+# Format-examples block — appended ONLY in L_examples condition.
+# Teaches the LLM what concrete action surface forms look like (without giving
+# game-specific affordance info). This is what enables L_examples to train at
+# all — without it, the model would hallucinate wrong formats like 'move left'.
+EXAMPLES_BLOCK = (
+    "Examples of valid action surface forms (the placeholders <obj> <id> get "
+    "filled in based on what is in your room — your specific room will have "
+    "DIFFERENT objects, colors, and IDs than these examples):\n"
+    "- 'turn left'\n"
+    "- 'turn right'\n"
+    "- 'move forward'\n"
+    "- 'go to red ball 1'\n"
+    "- 'go to grey closed door 1'\n"
+    "- 'pick up yellow key 1'\n"
+    "- 'pick up purple ball 1'\n"
+    "- 'drop'\n"
+    "- 'toggle and go through red closed door 1'\n"
+    "- 'go through red open door 1'\n"
+    "- 'toggle'\n"
+    "- 'check available actions'\n\n"
+    "Object IDs use the form '<color> <object> <integer>'. Each turn you will "
+    "receive a description of what you can see; construct a valid action by "
+    "combining the schema above with the objects in your observation.\n\n"
+)
+
+FORMAT_BLOCK = (
     "Your response must follow this format:\n"
     "Thought:\n"
     "your thoughts.\n\n"
@@ -84,32 +111,63 @@ SYSTEM_PROMPT = (
 )
 
 
-def _format_initial_user_with_list(obs: str, admissible: list[str]) -> str:
-    """L_per_step initial user msg — matches AgentGym BabyAI observe() format."""
-    return f"{obs}\nAvailable actions: [{', '.join(repr(a) for a in admissible)}]"
+def _system_prompt_for(condition: str) -> str:
+    """Build the right system prompt for each condition."""
+    if condition == "examples":
+        return SYSTEM_PROMPT_BASE + EXAMPLES_BLOCK + FORMAT_BLOCK
+    # per_step and shuffled share the same system prompt (no examples block)
+    return SYSTEM_PROMPT_BASE + FORMAT_BLOCK
 
 
-def _format_initial_user_no_list(obs: str) -> str:
-    """L_none initial user msg — observation only, no list ever shown.
+# Legacy export — kept for backwards compatibility with any callers that
+# reference SYSTEM_PROMPT directly. Equals the per_step/shuffled prompt.
+SYSTEM_PROMPT = _system_prompt_for("per_step")
 
-    NOTE: we intentionally do NOT add length-matched filler. Filler text would
-    be unnatural and would itself be a confound. The length difference is a
-    real consequence of removing the list and is part of the variable we test.
+
+def _rewrite_list_for_llm(admissible: list[str]) -> list[str]:
+    """Translate AgentGym's quirky surface forms into natural English before
+    showing them to the LLM. Inverse of action normalization at env boundary
+    (see babyai_interaction.py). Currently rewrites: 'pickup X' -> 'pick up X'."""
+    import re as _re
+    out = []
+    for a in admissible:
+        a = _re.sub(r"^pickup\s+", "pick up ", a)
+        out.append(a)
+    return out
+
+
+def _format_initial_user_with_list(obs: str, admissible: list[str], goal: str) -> str:
+    """L_per_step initial user msg — observation + per-instance action list,
+    prefixed with the task goal. Without the goal the LLM doesn't know what
+    to do (was a real bug in earlier smokes).
     """
-    return obs
+    rewritten = _rewrite_list_for_llm(admissible)
+    return (
+        f"Goal: {goal}\n\n"
+        f"{obs}\n"
+        f"Available actions: [{', '.join(repr(a) for a in rewritten)}]"
+    )
+
+
+def _format_initial_user_no_list(obs: str, goal: str) -> str:
+    """L_none initial user msg — observation only (no list), but goal is
+    still required so the model knows what task to solve."""
+    return f"Goal: {goal}\n\n{obs}"
 
 
 def _build_split_rows(
     levels: list[str],
     seeds_per_level: list[int],
     split_role: str,
-    condition: str,  # "per_step" or "none"
+    condition: str,  # "per_step", "shuffled", or "examples"
 ) -> list[dict]:
     """Build rows by iterating each (level, seed) pair. Level order interleaved
     so train batches are balanced across levels."""
     from agentenv_babyai.environment import BabyAI
 
-    assert condition in ("per_step", "none"), f"unknown condition {condition}"
+    assert condition in ("per_step", "shuffled", "examples"), f"unknown condition {condition}"
+
+    system_prompt = _system_prompt_for(condition)
 
     # Interleave: (level0, seed0), (level1, seed0), ..., (level0, seed1), (level1, seed1), ...
     pairs: list[tuple[str, int]] = []
@@ -127,15 +185,18 @@ def _build_split_rows(
         obs = env._get_obs()
         env.env.close()
 
-        if condition == "per_step":
-            initial_user = _format_initial_user_with_list(obs, admissible)
-        else:  # "none"
-            initial_user = _format_initial_user_no_list(obs)
+        # per_step and shuffled both show the list at turn 0 (canonical order).
+        # shuffled's per-turn shuffling happens at rollout time in the Interaction.
+        # examples: no per-instance list at turn 0; system prompt has format examples.
+        if condition in ("per_step", "shuffled"):
+            initial_user = _format_initial_user_with_list(obs, admissible, goal)
+        else:  # "examples"
+            initial_user = _format_initial_user_no_list(obs, goal)
 
         rows.append({
             "data_source": "babyai",
             "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": initial_user},
             ],
             "ability": "agentic",
@@ -175,15 +236,15 @@ def build_dataset(
     levels: tuple[str, ...] = DEFAULT_TRAIN_LEVELS,
     n_train_per_level: int = 80,    # 80 × 3 = 240 train tasks
     n_val_per_level: int = 20,      # 20 × 3 = 60 val tasks
-    output_root: str = "babyai_listablate_v1",
+    output_root: str = "babyai_phase1_v1",
 ) -> dict:
-    """Generate two parquet pairs (one per condition) for the L_per_step vs
-    L_none ablation. Output paths:
+    """Generate three parquet pairs (one per Phase 1 condition):
       /output/data/{output_root}/per_step/{train,val}.parquet
-      /output/data/{output_root}/none/{train,val}.parquet
+      /output/data/{output_root}/shuffled/{train,val}.parquet  (initial msg same as per_step; shuffle happens at rollout time in Interaction)
+      /output/data/{output_root}/examples/{train,val}.parquet  (different system prompt — adds EXAMPLES_BLOCK; initial msg has no list)
 
-    The Modal training script must be configured with the right parquet path
-    AND the matching `show_action_list_per_turn` flag in the interaction YAML.
+    The Modal training script picks the parquet path AND the matching
+    interaction YAML based on the `condition` argument.
     """
     import os
     import pandas as pd
@@ -192,14 +253,11 @@ def build_dataset(
     print(f"=== levels={levels} n_train_per_level={n_train_per_level} "
           f"n_val_per_level={n_val_per_level} ===", flush=True)
 
-    # Disjoint seed ranges:
-    #   train: seeds 0..n_train_per_level-1 (per level)
-    #   val:   seeds 100_000..100_000+n_val_per_level-1 (per level)
     train_seeds = list(range(0, n_train_per_level))
     val_seeds = list(range(100_000, 100_000 + n_val_per_level))
 
     summary: dict[str, dict] = {}
-    for condition in ("per_step", "none"):
+    for condition in ("per_step", "shuffled", "examples"):
         print(f"\n=== building condition={condition} ===")
 
         train_rows = _build_split_rows(levels, train_seeds, "train", condition)
@@ -238,5 +296,5 @@ def main():
         levels=DEFAULT_TRAIN_LEVELS,
         n_train_per_level=80,
         n_val_per_level=20,
-        output_root="babyai_listablate_v1",
+        output_root="babyai_phase1_v1",
     ))

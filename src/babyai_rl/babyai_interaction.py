@@ -81,19 +81,50 @@ def _parse_action(raw: str, admissible: list[str]) -> tuple[str, str]:
     return lines[-1].strip("`'\""), "fallback_last_line"
 
 
+def _rewrite_list_for_llm(admissible: list[str]) -> list[str]:
+    """Outgoing rewrite: AgentGym's quirky surface forms -> natural English.
+    Currently rewrites 'pickup X' -> 'pick up X' so the LLM sees natural
+    English in the admissible list. Symmetric with _normalize_action_for_env
+    on the incoming side."""
+    out = []
+    for a in admissible:
+        a = re.sub(r"^pickup\s+", "pick up ", a)
+        out.append(a)
+    return out
+
+
+def _normalize_action_for_env(action: str) -> str:
+    """Incoming rewrite: LLM's natural English -> AgentGym's expected form.
+    'pick up X' -> 'pickup X'. Applied just before env.step() so the LLM is
+    free to write 'pick up X' (matching its English prior) without being
+    penalized for AgentGym's spelling quirk."""
+    a = action.strip()
+    a = re.sub(r"^pick\s+up\s+", "pickup ", a, flags=re.IGNORECASE)
+    a = re.sub(r"^pick-up\s+", "pickup ", a, flags=re.IGNORECASE)
+    return a
+
+
 def _format_observation(
     obs: str,
     admissible: list[str],
     turn: int,
     max_turns: int,
     show_action_list: bool = True,
+    shuffle_list: bool = False,
 ) -> str:
-    """Per-turn user message. Matches AgentGym BabyAI format:
-    show_action_list=True: obs already has \\nAvailable actions: [...] appended (BabyAI default).
-    show_action_list=False: just obs (rare for BabyAI but supported for ablations)."""
-    if show_action_list:
-        return f"{obs}\nAvailable actions: [{', '.join(repr(a) for a in admissible)}]"
-    return obs
+    """Per-turn user message. Matches AgentGym BabyAI format with one fix:
+    we rewrite 'pickup X' -> 'pick up X' so the LLM sees natural English.
+
+    shuffle_list=True (L_shuffled condition): permute the admissible list
+    randomly per turn — preserves information content but eliminates
+    positional/string-rote learning."""
+    if not show_action_list:
+        return obs
+    rewritten = _rewrite_list_for_llm(admissible)
+    if shuffle_list:
+        import random as _random
+        rewritten = _random.sample(rewritten, len(rewritten))
+    return f"{obs}\nAvailable actions: [{', '.join(repr(a) for a in rewritten)}]"
 
 
 class BabyAIInteraction(BaseInteraction):
@@ -106,12 +137,14 @@ class BabyAIInteraction(BaseInteraction):
         self.max_turns = int(config.get("max_turns", 30))
         self.max_episode_steps = int(config.get("max_episode_steps", 50))
         self.show_action_list_per_turn = bool(config.get("show_action_list_per_turn", True))
+        self.shuffle_list_per_turn = bool(config.get("shuffle_list_per_turn", False))
         logger.warning(
             "BabyAIInteraction init: max_turns=%d, default_game=%s, "
-            "show_action_list_per_turn=%s, raw config keys=%s",
+            "show_action_list_per_turn=%s shuffle_list_per_turn=%s raw config keys=%s",
             self.max_turns,
             self.default_game_name,
             self.show_action_list_per_turn,
+            self.shuffle_list_per_turn,
             list(config.keys()),
         )
 
@@ -189,10 +222,16 @@ class BabyAIInteraction(BaseInteraction):
         t_parse_start = time.time()
         action, parse_path = _parse_action(assistant_content, state["admissible"])
         t_parse_end = time.time()
-        action_in_admissible = action.lower() in {a.lower() for a in state["admissible"]}
+
+        # Translate the LLM's natural English action into AgentGym's expected
+        # surface form (e.g., 'pick up X' -> 'pickup X') before env.step.
+        # The pre-normalization action is what we log; the post-normalization
+        # action is what the env actually sees.
+        action_for_env = _normalize_action_for_env(action)
+        action_in_admissible = action_for_env.lower() in {a.lower() for a in state["admissible"]}
 
         t_step_start = time.time()
-        obs, reward, done, infos = state["env"].step(action)
+        obs, reward, done, infos = state["env"].step(action_for_env)
         t_step_end = time.time()
 
         reward_this_turn = float(reward) - float(state["cumulative_reward"])
@@ -223,6 +262,7 @@ class BabyAIInteraction(BaseInteraction):
             state["turn"],
             self.max_turns,
             show_action_list=self.show_action_list_per_turn,
+            shuffle_list=self.shuffle_list_per_turn,
         )
 
         extra = {
@@ -238,6 +278,8 @@ class BabyAIInteraction(BaseInteraction):
             "assistant_raw": assistant_content,
             "assistant_raw_chars": len(assistant_content),
             "action_parsed": action,
+            "action_sent_to_env": action_for_env,  # post-normalization
+            "action_was_normalized": action != action_for_env,
             "parse_path": parse_path,
             "action_in_admissible": action_in_admissible,
             "action_is_valid": bool(infos.get("action_is_valid", False)),

@@ -1,0 +1,14 @@
+interaction:
+  - name: "babyai"
+    class_name: "babyai_rl.babyai_interaction.BabyAIInteraction"
+    config:
+      default_game_name: "BabyAI-GoToLocal-v0"
+      max_turns: 30
+      max_episode_steps: 50
+      # L_examples: the per-instance admissible list is NEVER shown (turn 0
+      # initial user msg also omits it; see prepare_babyai_data.py for the
+      # examples-condition parquet). The system prompt for this condition
+      # includes a format-examples block teaching action surface forms so
+      # the model can still construct valid actions.
+      show_action_list_per_turn: False
+      shuffle_list_per_turn: False
