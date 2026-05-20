@@ -47,7 +47,7 @@ image = (
         "PYTHONPATH": "/root/project/src",
     })
     .add_local_dir(
-        "c:/Users/Alfred/Desktop/project-cs224r/src",
+        "/Users/hana/Desktop/project-cs224r/src",
         remote_path="/root/project/src",
     )
 )
@@ -115,7 +115,8 @@ def _system_prompt_for(condition: str) -> str:
     """Build the right system prompt for each condition."""
     if condition == "examples":
         return SYSTEM_PROMPT_BASE + EXAMPLES_BLOCK + FORMAT_BLOCK
-    # per_step and shuffled share the same system prompt (no examples block)
+    # per_step, shuffled, and init share the same base schema prompt.
+    # (init strips "check available actions" from the turn-0 list separately.)
     return SYSTEM_PROMPT_BASE + FORMAT_BLOCK
 
 
@@ -136,12 +137,17 @@ def _rewrite_list_for_llm(admissible: list[str]) -> list[str]:
     return out
 
 
-def _format_initial_user_with_list(obs: str, admissible: list[str], goal: str) -> str:
-    """L_per_step initial user msg — observation + per-instance action list,
-    prefixed with the task goal. Without the goal the LLM doesn't know what
-    to do (was a real bug in earlier smokes).
+def _format_initial_user_with_list(
+    obs: str, admissible: list[str], goal: str, exclude: set[str] | None = None
+) -> str:
+    """L_per_step / L_init initial user msg — observation + per-instance action list,
+    prefixed with the task goal. exclude: action strings to strip from the list
+    (used by L_init to remove 'check available actions' so the LLM never learns
+    it can call it to recover the list on demand).
     """
     rewritten = _rewrite_list_for_llm(admissible)
+    if exclude:
+        rewritten = [a for a in rewritten if a.lower() not in exclude]
     return (
         f"Goal: {goal}\n\n"
         f"{obs}\n"
@@ -165,7 +171,7 @@ def _build_split_rows(
     so train batches are balanced across levels."""
     from agentenv_babyai.environment import BabyAI
 
-    assert condition in ("per_step", "shuffled", "examples"), f"unknown condition {condition}"
+    assert condition in ("per_step", "shuffled", "examples", "init"), f"unknown condition {condition}"
 
     system_prompt = _system_prompt_for(condition)
 
@@ -185,12 +191,18 @@ def _build_split_rows(
         obs = env._get_obs()
         env.env.close()
 
-        # per_step and shuffled both show the list at turn 0 (canonical order).
-        # shuffled's per-turn shuffling happens at rollout time in the Interaction.
-        # examples: no per-instance list at turn 0; system prompt has format examples.
+        # per_step / shuffled: full list at turn 0; shuffled's per-turn shuffle
+        #   happens at rollout time in the Interaction.
+        # init: list at turn 0 but "check available actions" stripped — the LLM
+        #   never learns this backdoor exists, and the interaction blocks it too.
+        # examples / none: no per-instance list at turn 0.
         if condition in ("per_step", "shuffled"):
             initial_user = _format_initial_user_with_list(obs, admissible, goal)
-        else:  # "examples"
+        elif condition == "init":
+            initial_user = _format_initial_user_with_list(
+                obs, admissible, goal, exclude={"check available actions"}
+            )
+        else:
             initial_user = _format_initial_user_no_list(obs, goal)
 
         rows.append({
@@ -257,7 +269,7 @@ def build_dataset(
     val_seeds = list(range(100_000, 100_000 + n_val_per_level))
 
     summary: dict[str, dict] = {}
-    for condition in ("per_step", "shuffled", "examples"):
+    for condition in ("per_step", "shuffled", "examples", "init"):
         print(f"\n=== building condition={condition} ===")
 
         train_rows = _build_split_rows(levels, train_seeds, "train", condition)
@@ -297,4 +309,19 @@ def main():
         n_train_per_level=80,
         n_val_per_level=20,
         output_root="babyai_phase1_v1",
+    ))
+
+
+@app.local_entrypoint()
+def smoke():
+    """Minimal data prep for smoke testing: 2 conditions, 6 train + 2 val seeds per level.
+    6 seeds × 3 levels = 18 rows per condition — just enough to fill one training batch.
+    Run with: modal run scripts/prepare_babyai_data.py::smoke
+    """
+    print(build_dataset.remote(
+        levels=DEFAULT_TRAIN_LEVELS,
+        n_train_per_level=6,
+        n_val_per_level=2,
+        output_root="babyai_smoke",
+        conditions=("per_step", "init"),
     ))

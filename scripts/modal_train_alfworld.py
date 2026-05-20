@@ -51,7 +51,7 @@ training_image = (
         "RAY_DEDUP_LOGS": "0",
     })
     .add_local_dir(
-        "c:/Users/Alfred/Desktop/project-cs224r",
+        "/Users/hana/Desktop/project-cs224r",
         remote_path="/root/project",
     )
 )

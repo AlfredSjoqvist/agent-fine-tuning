@@ -138,13 +138,16 @@ class BabyAIInteraction(BaseInteraction):
         self.max_episode_steps = int(config.get("max_episode_steps", 50))
         self.show_action_list_per_turn = bool(config.get("show_action_list_per_turn", True))
         self.shuffle_list_per_turn = bool(config.get("shuffle_list_per_turn", False))
+        self.block_check_available = bool(config.get("block_check_available", False))
         logger.warning(
             "BabyAIInteraction init: max_turns=%d, default_game=%s, "
-            "show_action_list_per_turn=%s shuffle_list_per_turn=%s raw config keys=%s",
+            "show_action_list_per_turn=%s shuffle_list_per_turn=%s "
+            "block_check_available=%s raw config keys=%s",
             self.max_turns,
             self.default_game_name,
             self.show_action_list_per_turn,
             self.shuffle_list_per_turn,
+            self.block_check_available,
             list(config.keys()),
         )
 
@@ -233,6 +236,34 @@ class BabyAIInteraction(BaseInteraction):
         t_step_start = time.time()
         obs, reward, done, infos = state["env"].step(action_for_env)
         t_step_end = time.time()
+
+        # Block the list-recovery backdoor AFTER env.step by intercepting on
+        # the env's response pattern. The env accepts many fuzzy input variants
+        # of "check available actions", so matching the output is more robust.
+        if self.block_check_available and obs.startswith("You can take the following actions"):
+            state["turn"] += 1
+            should_terminate = state["turn"] >= self.max_turns
+            next_prompt = "That action is not available. Use the schema and your observation to choose a valid action."
+            _dump_event(instance_id, {
+                "event": "turn",
+                "turn": state["turn"],
+                "assistant_raw": assistant_content,
+                "action_parsed": action,
+                "action_sent_to_env": action_for_env,
+                "parse_path": parse_path,
+                "blocked": True,
+                "reward_delta": 0.0,
+                "cumulative_reward": state["cumulative_reward"],
+                "env_done": False,
+                "should_terminate": should_terminate,
+            })
+            return should_terminate, next_prompt, 0.0, {
+                "turn": state["turn"],
+                "action_sent": action,
+                "cumulative_reward": state["cumulative_reward"],
+                "env_done": False,
+                "task_success": state["task_success"],
+            }
 
         reward_this_turn = float(reward) - float(state["cumulative_reward"])
         # BabyAI's wrapper returns the running max reward, not per-step delta.

@@ -109,6 +109,10 @@ SCHEMA_BLOCK = (
     "- check available actions\n\n"
 )
 
+# L_init omits "check available actions" from the schema so the LLM never
+# learns the backdoor exists (the interaction also blocks it at runtime).
+SCHEMA_BLOCK_NO_CHECK = SCHEMA_BLOCK.replace("- check available actions\n", "")
+
 EXAMPLES_BLOCK = (
     "Examples of valid action surface forms (the placeholders <obj> <id> get "
     "filled in based on what is in your room — your specific room will have "
@@ -177,7 +181,8 @@ FORMAT_BLOCK = (
 
 
 def build_system_prompt(condition: str) -> str:
-    parts = [INTRO, SCHEMA_BLOCK]
+    schema = SCHEMA_BLOCK_NO_CHECK if condition == "init" else SCHEMA_BLOCK
+    parts = [INTRO, schema]
     if condition == "examples":
         parts.append(EXAMPLES_BLOCK)
     parts.append(CONTRACTS[condition])
@@ -235,8 +240,11 @@ def make_initial_user(
     experiment — the LLM would otherwise be guessing what task to solve.
     """
     goal_line = f"Goal: {goal}\n\n" if goal else ""
-    if condition in ("per_step", "init"):
+    if condition == "per_step":
         return goal_line + _format_obs_with_list(obs, admissible)
+    if condition == "init":
+        filtered = [a for a in admissible if a.lower() != "check available actions"]
+        return goal_line + _format_obs_with_list(obs, filtered)
     return goal_line + obs
 
 
@@ -302,6 +310,7 @@ def show_prompts():
         "go to green ball 1", "go to grey closed door 1",
         "check available actions",
     ]
+    fake_admissible_init = [a for a in fake_admissible if a != "check available actions"]
     fake_goal = "go to the green ball"
     for cond in ("per_step", "init", "examples", "none"):
         print()
@@ -309,9 +318,10 @@ def show_prompts():
         print(Color.wrap(f"  CONDITION: L_{cond}", "bold"))
         print(Color.wrap(hr("═"), "bold"))
         print_message(f"system (sent once)", build_system_prompt(cond))
+        admissible_for_cond = fake_admissible_init if cond == "init" else fake_admissible
         print_message(
             f"user — turn 0 (initial)",
-            make_initial_user(fake_obs, fake_admissible, cond, goal=fake_goal),
+            make_initial_user(fake_obs, admissible_for_cond, cond, goal=fake_goal),
         )
         print_message(
             f"user — turn 1+ (after a step)",
@@ -389,6 +399,14 @@ def play(condition: str, level: str, seed: int, max_turns: int):
         was_valid = bool(infos.get("action_is_valid", False))
         turn += 1
         done = bool(env_done)
+
+        # Block the list-recovery backdoor for init condition by intercepting
+        # the env's response. The env accepts many fuzzy variants of "check
+        # available actions" so we match on the response pattern instead of
+        # the input string.
+        if condition == "init" and obs.startswith("You can take the following actions"):
+            print_meta("blocked: action list recovery is not available in L_init", "red")
+            continue
 
         new_admissible = env._get_action_space()
         per_turn_user = make_per_turn_user(obs, new_admissible, condition)

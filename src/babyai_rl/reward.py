@@ -1,92 +1,55 @@
-"""Custom reward function for verl's reward_manager dispatch.
-
-verl's NaiveRewardManager calls compute_score(data_source, solution_str, ground_truth, extra_info, ...).
-extra_info["rollout_reward_scores"] (or turn_scores / tool_rewards) holds the
-per-turn rewards from the BabyAI Interaction.
-
-BabyAI gives DENSE rewards (incremental progress toward goal). We aggregate by
-taking the cumulative max — the highest reward state reached across the rollout.
-This is faithful to BabyAI semantics where reward=1.0 means task completed.
 """
+A single function verl calls after each rollout to turn environment feedback into one scalar reward for GRPO/PPO.
 
-import logging
-import os
-import threading
-
-logger = logging.getLogger(__name__)
-
-_LOCK = threading.Lock()
-_N_CALLS = 0
-_N_SUCCESS = 0
-_N_NONZERO = 0
-_REPORT_EVERY = int(os.environ.get("BABYAI_REWARD_REPORT_EVERY", "16"))
-
+Return the sum of per-turn reward deltas, which verl already collected in extra_info["turn_scores"]
+This part of code is not AI-generated. @Hana
+"""
 
 def compute_score(
     data_source: str,
     solution_str: str,
     ground_truth: str,
-    extra_info: dict | None = None,
-    **kwargs,
+    extra_info: dict | None,
+    **kwargs
 ) -> float:
-    global _N_CALLS, _N_SUCCESS, _N_NONZERO
-
+    
+    # Guard: if extra_info is missing or empty 
     if not extra_info:
-        print("[BABYAI_REWARD] WARN: empty extra_info; returning 0.0", flush=True)
+        print("[BABYAI] WARN: empty extra_info, returning 0.0 ")
         return 0.0
 
-    scores = extra_info.get("rollout_reward_scores", None)
-    turn_scores = extra_info.get("turn_scores", None)
-    tool_rewards = extra_info.get("tool_rewards", None)
+    # get values 
+    per_turn_scores = extra_info.get("turn_scores", [])
 
-    candidates = []
-    for v in (scores, turn_scores, tool_rewards):
-        if v is None:
-            continue
-        if isinstance(v, dict):
-            candidates.extend(v.values())
-        elif isinstance(v, (list, tuple)):
-            candidates.extend(v)
-        else:
-            candidates.append(v)
 
-    flat = []
-    for v in candidates:
-        if isinstance(v, (list, tuple)):
-            flat.extend(v)
-        else:
-            flat.append(v)
-
-    numeric = []
-    for v in flat:
-        try:
-            numeric.append(float(v))
+    # shape validation 
+    # guard for per_turn_scores empty
+    if not per_turn_scores:
+        print("[BABYAI] WARN: empty turn_scores, rewards misssing, returning 0.0 ")
+        return 0.0
+    
+    assert isinstance(per_turn_scores, list), \
+        f"expected sequence of non-empty per-turn rewards, got {per_turn_scores!r}"
+    assert len(per_turn_scores) <= 30, \
+        f"sequence length {len(per_turn_scores)} exceed max_turns=30"
+    
+    # coercion loop converting all elements into float 
+    scores = []
+    for score in per_turn_scores:
+        try: 
+            scores.append(float(score))
         except (TypeError, ValueError):
-            pass
+            # TypeError: something float() can't even attempt
+            # ValueError: a string that float() tries but fails on 
+            pass # skip policy — bad entry is dropped silently
 
-    # BabyAI returns reward DELTAS per turn (we made the Interaction emit deltas).
-    # Cumulative reward = sum of deltas. Success = cumulative ≥ 1.0.
-    cumulative = sum(numeric) if numeric else 0.0
+    # guard after coercion in case all entries bad and skipped, returning empty list
+    if not scores:
+        print("[BABYAI] WARN: empty scores, only bad entries, returning 0.0 ")
+        return 0.0
 
-    with _LOCK:
-        _N_CALLS += 1
-        if cumulative > 0:
-            _N_NONZERO += 1
-        if cumulative >= 1.0 - 1e-6:
-            _N_SUCCESS += 1
-        if _N_CALLS % _REPORT_EVERY == 0:
-            print(
-                f"[BABYAI_REWARD] window n={_REPORT_EVERY} "
-                f"successes={_N_SUCCESS}/{_N_CALLS} "
-                f"nonzero={_N_NONZERO}/{_N_CALLS} "
-                f"({100.0 * _N_SUCCESS / _N_CALLS:.1f}% / "
-                f"{100.0 * _N_NONZERO / _N_CALLS:.1f}% cumulative since proc start)",
-                flush=True,
-            )
+    # final summation and return 
+    cumulative = sum(scores)
+    return cumulative 
 
-    if cumulative >= 1.0 - 1e-6:
-        print(
-            f"[BABYAI_REWARD] SUCCESS cumulative={cumulative:.2f} n_deltas={len(numeric)}",
-            flush=True,
-        )
-    return cumulative
+    

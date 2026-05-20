@@ -32,7 +32,7 @@ image = (
         "cp /tmp/alfworld_repo/configs/base_config.yaml /root/alfworld_data/configs/base_config.yaml",
     )
     .add_local_dir(
-        "c:/Users/Alfred/Desktop/project-cs224r/src",
+        "/Users/hana/Desktop/project-cs224r/src",
         remote_path="/root/project/src",
     )
 )

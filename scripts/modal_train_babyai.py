@@ -51,7 +51,7 @@ training_image = (
         "RAY_DEDUP_LOGS": "0",
     })
     .add_local_dir(
-        "c:/Users/Alfred/Desktop/project-cs224r",
+        "/Users/hana/Desktop/project-cs224r",
         remote_path="/root/project",
     )
 )
@@ -66,22 +66,29 @@ volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
     timeout=86400,  # 24hr — runtime estimates have been wrong every time
     memory=131072,
 )
-def train_test(condition: str = "per_step", total_steps: int = 1, seed: int = 0) -> dict:
+def train_test(
+    condition: str = "per_step",
+    total_steps: int = 1,
+    seed: int = 0,
+    data_root: str = "babyai_phase1_v1",
+) -> dict:
     """Run a single GRPO training session.
 
     Args:
-        condition: one of "per_step", "shuffled", "examples".
+        condition: one of "per_step", "init", "shuffled", "examples".
                    Selects the parquet path AND the interaction config YAML.
         total_steps: number of GRPO training steps.
         seed: random seed for trainer; included in run_id and experiment_name so
               concurrent runs don't collide on volume paths.
+        data_root: parquet directory name under /output/data/ — use "babyai_smoke"
+                   for smoke tests, "babyai_phase1_v1" for full runs.
     """
     import json
     import os
     import subprocess
     import time
 
-    assert condition in ("per_step", "shuffled", "examples"), f"unknown condition {condition}"
+    assert condition in ("per_step", "shuffled", "examples", "init"), f"unknown condition {condition}"
 
     os.chdir("/opt/verl")
 
@@ -145,8 +152,8 @@ def train_test(condition: str = "per_step", total_steps: int = 1, seed: int = 0)
         "trainer.total_epochs=100",
         f"trainer.total_training_steps={total_steps}",
         f"trainer.default_local_dir=/output/ckpts/{run_id}",
-        f"data.train_files=/output/data/babyai_phase1_v1/{condition}/train.parquet",
-        f"data.val_files=/output/data/babyai_phase1_v1/{condition}/val.parquet",
+        f"data.train_files=/output/data/{data_root}/{condition}/train.parquet",
+        f"data.val_files=/output/data/{data_root}/{condition}/val.parquet",
         f"actor_rollout_ref.rollout.multi_turn.interaction_config_path=/root/project/src/babyai_rl/configs/interaction_config/babyai_interaction_{condition}.yaml",
         "custom_reward_function.path=/root/project/src/babyai_rl/reward.py",
         "custom_reward_function.name=compute_score",
@@ -201,18 +208,46 @@ def train_test(condition: str = "per_step", total_steps: int = 1, seed: int = 0)
 
 @app.local_entrypoint()
 def main():
-    """Phase 1 gating smoke: 3 conditions × 20 steps × 1 seed, parallel.
+    """Phase 1 full run: per_step + init × 20 steps × 1 seed, parallel.
 
     Modal will queue the spawns if 8-GPU containers are not all available
     simultaneously; each completes independently.
     """
-    CONDITIONS = ("per_step", "shuffled", "examples")
+    CONDITIONS = ("per_step", "init")
     STEPS = 20
     SEED = 0
-    print(f"=== launching Phase 1 gating ({len(CONDITIONS)} conditions × {STEPS} steps × 1 seed) ===")
+    print(f"=== launching Phase 1 ({len(CONDITIONS)} conditions × {STEPS} steps × 1 seed) ===")
     handles = []
     for cond in CONDITIONS:
         h = train_test.spawn(condition=cond, total_steps=STEPS, seed=SEED)
+        print(f"  spawned {cond}: {h}")
+        handles.append((cond, h))
+
+    print("\n=== awaiting runs ===")
+    for cond, h in handles:
+        try:
+            r = h.get()
+            print(f"  [{cond}] done: {r}")
+        except Exception as e:
+            print(f"  [{cond}] FAILED: {e}")
+
+
+@app.local_entrypoint()
+def smoke():
+    """Smoke test: per_step + init × 1 step, reads from babyai_smoke parquets.
+    Run data prep first: modal run scripts/prepare_babyai_data.py::smoke
+    Then: modal run scripts/modal_train_babyai.py::smoke
+    """
+    CONDITIONS = ("per_step", "init")
+    STEPS = 1
+    SEED = 0
+    print(f"=== smoke test ({len(CONDITIONS)} conditions × {STEPS} step) ===")
+    handles = []
+    for cond in CONDITIONS:
+        h = train_test.spawn(
+            condition=cond, total_steps=STEPS, seed=SEED,
+            data_root="babyai_phase1_v1",
+        )
         print(f"  spawned {cond}: {h}")
         handles.append((cond, h))
 

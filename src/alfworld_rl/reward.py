@@ -7,11 +7,8 @@ For ALFWorld the env emits reward=1.0 only on task completion, 0.0 otherwise.
 So `max(rollout_reward_scores) > 0` is a correct task-success signal.
 """
 
-import logging
 import os
 import threading
-
-logger = logging.getLogger(__name__)
 
 # Process-local counters so we can periodically dump batch stats. Reset on
 # every "report" interval so the log shows per-window success rates rather
