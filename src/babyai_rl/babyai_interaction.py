@@ -15,7 +15,34 @@ from typing import Any, Optional
 from uuid import uuid4
 from verl.interactions.base import BaseInteraction
 from agentenv_babyai.environment import BabyAI
+import json
+import logging
+import time
 import re 
+import os
+
+
+# trajectory dumping into paths like   /output/trajectories/1748012345/abc-123-instance-id.jsonl
+# read environment variables at import time 
+_DUMP_DIR = os.environ.get("BABYAI_TRAJECTORY_DUMP_DIR", "")
+# group all episodes from one training run together
+# BABYAI_TRAJECTORY_DUMP_RUN is not set in modal_train_babyai, so it falls back to Unix timestamp.
+# each run gets a unique folder automatically with Unix timestamp
+_DUMP_RUN_ID = os.environ.get("BABYAI_TRAJECTORY_DUMP_RUN", str(int(time.time()))) 
+
+def _dump_event(instance_id: str, event: dict) -> None:
+    if not _DUMP_DIR: # logging disabled
+        return
+    try: 
+        os.makedirs(f"{_DUMP_DIR}/{_DUMP_RUN_ID}", exist_ok=True)
+        path = f"{_DUMP_DIR}/{_DUMP_RUN_ID}/{instance_id}.jsonl"
+        event.setdefault("ts", time.time())
+        with open(path, "a") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+    except Exception as e:
+        logging.getLogger(__name__).warning("trajectory dump failed: %s", e) 
+
+
 
 def _build_prompt(
     obs: str,
@@ -123,9 +150,7 @@ class BabyAIInteraction(BaseInteraction):
         action_env = _normalize_action_for_env(action)
         # following AgentGym return signature, step the env 
         obs, reward, done, infos = state["env"].step(action_env)
-        state["obs"] = obs
-        state["admissible"] =state["env"]._get_action_space()
-        state["turn"] += 1 
+        
 
         # block the action list check for ablation tests
         if self.block_check_available and obs.startswith("You can take the following actions"): 
@@ -137,6 +162,11 @@ class BabyAIInteraction(BaseInteraction):
                 "env_done": False,
                 "task_success": state["task_success"],
             }
+
+        state["obs"] = obs
+        state["admissible"] =state["env"]._get_action_space()
+        state["turn"] += 1 
+        state["done"] = done
 
         success_this_turn = done and float(reward) > 0
         if success_this_turn:
@@ -169,5 +199,20 @@ class BabyAIInteraction(BaseInteraction):
 
     async def finalize_interaction(self, instance_id, **kwargs) -> None: 
         """Clean up env handle, remove from instance dict."""
+        # guard against empty instance dict
+        state = self._instance_dict.get(instance_id, {})
+        _dump_event(instance_id, {
+            "event": "finalize",
+            "final_turn": state.get("turn", 0),
+            "task_reward": state.get("task_reward", 0.0),
+            "task_success": state.get("task_success", False),
+            "env_done": state.get("done", False),
+        })
+        env = state.get("env")
+        if env is not None:
+            try:
+                env.env.close()
+            except Exception:
+                pass
         self._instance_dict.pop(instance_id, None)
 
