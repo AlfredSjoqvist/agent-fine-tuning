@@ -1,9 +1,8 @@
-"""Interactive BabyAI player for testing the four harness designs.
+"""Interactive BabyAI player for testing the two experiment conditions.
 
 Plays a BabyAI episode in your terminal showing you THE EXACT MESSAGES the LLM
-would see under each of the four conditions (L_per_step, L_init, L_examples,
-L_none). You type the action each turn. The env steps, the next user message
-is shown verbatim as the LLM would receive it.
+would see under L_per_step or L_examples. You type the action each turn.
+The env steps, the next user message is shown verbatim as the LLM would receive it.
 
 ------------------------------------------------------------------------------
 SETUP (one-time)
@@ -24,20 +23,14 @@ RUN
     # Play under L_per_step (Xi's BabyAI default — list every turn)
     python scripts/play_babyai.py --condition per_step
 
-    # Play under L_init (list at turn 0, observation only after)
-    python scripts/play_babyai.py --condition init
-
     # Play under L_examples (system prompt has format examples; no per-instance list)
     python scripts/play_babyai.py --condition examples
-
-    # Play under L_none (no list, no examples — schema only)
-    python scripts/play_babyai.py --condition none
 
     # Other useful flags
     python scripts/play_babyai.py --condition examples --level BabyAI-Pickup-v0 --seed 7
     python scripts/play_babyai.py --condition examples --no-color
 
-    # Compare the prompts of all four conditions WITHOUT playing
+    # Compare the prompts of both conditions WITHOUT playing
     python scripts/play_babyai.py --show-prompts
 
 ------------------------------------------------------------------------------
@@ -109,10 +102,6 @@ SCHEMA_BLOCK = (
     "- check available actions\n\n"
 )
 
-# L_init omits "check available actions" from the schema so the LLM never
-# learns the backdoor exists (the interaction also blocks it at runtime).
-SCHEMA_BLOCK_NO_CHECK = SCHEMA_BLOCK.replace("- check available actions\n", "")
-
 EXAMPLES_BLOCK = (
     "Examples of valid action surface forms (the placeholders <obj> <id> get "
     "filled in based on what is in your room — your specific room will have "
@@ -151,22 +140,10 @@ CONTRACTS = {
         "turn to reflect what is currently valid based on what you can see "
         "and where you are.\n\n"
     ),
-    "init": (
-        "At the start of the task, you will be given a list of "
-        "currently-available actions. For all subsequent turns, you will see "
-        "only the observation — you must derive valid actions from the schema "
-        "above and the objects you observe in the room.\n\n"
-    ),
     "examples": (
         "Each turn, you will see only an observation describing the room. "
         "Use the schema and the format examples above plus what you observe "
         "to choose a valid action.\n\n"
-    ),
-    "none": (
-        "Each turn, you will see only an observation describing the room. "
-        "Use the schema above and what you observe to choose a valid action. "
-        "If the environment responds with 'Nothing happens.', your action "
-        "was invalid — try a different one.\n\n"
     ),
 }
 
@@ -181,8 +158,7 @@ FORMAT_BLOCK = (
 
 
 def build_system_prompt(condition: str) -> str:
-    schema = SCHEMA_BLOCK_NO_CHECK if condition == "init" else SCHEMA_BLOCK
-    parts = [INTRO, schema]
+    parts = [INTRO, SCHEMA_BLOCK]
     if condition == "examples":
         parts.append(EXAMPLES_BLOCK)
     parts.append(CONTRACTS[condition])
@@ -233,18 +209,11 @@ def make_initial_user(
     obs: str, admissible: list[str], condition: str, goal: str = ""
 ) -> str:
     """Turn-0 user message. The goal is prepended so the LLM knows the task.
-    L_per_step and L_init include the action list; L_examples and L_none don't.
-
-    NOTE: our existing data-prep code does NOT yet include the goal in the
-    parquet's initial user message. That's a real bug to fix before the full
-    experiment — the LLM would otherwise be guessing what task to solve.
+    per_step includes the action list; examples does not.
     """
     goal_line = f"Goal: {goal}\n\n" if goal else ""
     if condition == "per_step":
         return goal_line + _format_obs_with_list(obs, admissible)
-    if condition == "init":
-        filtered = [a for a in admissible if a.lower() != "check available actions"]
-        return goal_line + _format_obs_with_list(obs, filtered)
     return goal_line + obs
 
 
@@ -310,18 +279,16 @@ def show_prompts():
         "go to green ball 1", "go to grey closed door 1",
         "check available actions",
     ]
-    fake_admissible_init = [a for a in fake_admissible if a != "check available actions"]
     fake_goal = "go to the green ball"
-    for cond in ("per_step", "init", "examples", "none"):
+    for cond in ("per_step", "examples"):
         print()
         print(Color.wrap(hr("═"), "bold"))
         print(Color.wrap(f"  CONDITION: L_{cond}", "bold"))
         print(Color.wrap(hr("═"), "bold"))
         print_message(f"system (sent once)", build_system_prompt(cond))
-        admissible_for_cond = fake_admissible_init if cond == "init" else fake_admissible
         print_message(
             f"user — turn 0 (initial)",
-            make_initial_user(fake_obs, admissible_for_cond, cond, goal=fake_goal),
+            make_initial_user(fake_obs, fake_admissible, cond, goal=fake_goal),
         )
         print_message(
             f"user — turn 1+ (after a step)",
@@ -400,14 +367,6 @@ def play(condition: str, level: str, seed: int, max_turns: int):
         turn += 1
         done = bool(env_done)
 
-        # Block the list-recovery backdoor for init condition by intercepting
-        # the env's response. The env accepts many fuzzy variants of "check
-        # available actions" so we match on the response pattern instead of
-        # the input string.
-        if condition == "init" and obs.startswith("You can take the following actions"):
-            print_meta("blocked: action list recovery is not available in L_init", "red")
-            continue
-
         new_admissible = env._get_action_space()
         per_turn_user = make_per_turn_user(obs, new_admissible, condition)
 
@@ -447,7 +406,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument(
-        "--condition", choices=["per_step", "init", "examples", "none"],
+        "--condition", choices=["per_step", "examples"],
         default="per_step",
         help="Which harness to play under (default: per_step)",
     )

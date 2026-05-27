@@ -112,12 +112,7 @@ def _format_observation(
     show_action_list: bool = True,
     shuffle_list: bool = False,
 ) -> str:
-    """Per-turn user message. Matches AgentGym BabyAI format with one fix:
-    we rewrite 'pickup X' -> 'pick up X' so the LLM sees natural English.
-
-    shuffle_list=True (L_shuffled condition): permute the admissible list
-    randomly per turn — preserves information content but eliminates
-    positional/string-rote learning."""
+    """Per-turn user message. Rewrites 'pickup X' -> 'pick up X' for natural English."""
     if not show_action_list:
         return obs
     rewritten = _rewrite_list_for_llm(admissible)
