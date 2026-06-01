@@ -66,7 +66,7 @@ def train_test(
     condition: str = "per_step",
     total_steps: int = 1,
     seed: int = 0,
-    data_root: str = "babyai_v1",
+    data_root: str = "babyai_phase1_v1",
     resume_from: str | None = None,
 ) -> dict:
     """Run a single-phase GRPO training session.
@@ -77,7 +77,7 @@ def train_test(
         total_steps:  number of GRPO training steps.
         seed:         random seed; included in run_id so concurrent runs don't collide.
         data_root:    parquet directory name under /output/data/.
-                      Use "babyai_smoke" for smoke tests, "babyai_v1" for full runs.
+                      Use "babyai_smoke" for smoke tests, "babyai_phase1_v1" for full runs.
         resume_from:  if set, path to a checkpoint directory to resume from.
                       VERL will load the latest checkpoint found there and continue
                       training with the current condition's config.
@@ -157,10 +157,33 @@ def train_test(
     ]
 
     if resume_from:
-        cmd += [
-            "trainer.resume_mode=auto",
-            f"trainer.resume_training_path={resume_from}",
+        # VERL v0.7.1 has no resume_training_path key — resume is triggered by
+        # resume_mode=auto pointing at default_local_dir. Override that to the
+        # checkpoint dir so VERL finds the latest global_step there.
+        # total_training_steps is ABSOLUTE in VERL, so add the checkpoint's
+        # current step count to total_steps so VERL runs exactly total_steps more.
+        ckpt_step = 0
+        latest_file = os.path.join(resume_from, "latest_checkpointed_iteration.txt")
+        if os.path.exists(latest_file):
+            with open(latest_file) as f:
+                ckpt_step = int(f.read().strip())
+        else:
+            # Fall back: scan for highest global_step_N dir
+            import glob
+            dirs = glob.glob(os.path.join(resume_from, "global_step_*"))
+            if dirs:
+                ckpt_step = max(int(d.split("global_step_")[-1]) for d in dirs)
+        absolute_steps = ckpt_step + total_steps
+        print(f"resume_from={resume_from} ckpt_step={ckpt_step} → absolute total_training_steps={absolute_steps}")
+        cmd = [
+            f"trainer.default_local_dir={resume_from}" if c.startswith("trainer.default_local_dir=") else c
+            for c in cmd
         ]
+        cmd = [
+            f"trainer.total_training_steps={absolute_steps}" if c.startswith("trainer.total_training_steps=") else c
+            for c in cmd
+        ]
+        cmd += ["trainer.resume_mode=auto"]
 
     manifest = {
         "run_id": run_id,
@@ -197,9 +220,11 @@ def train_test(
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
-        for line in proc.stdout:
+        for i, line in enumerate(proc.stdout):
             print(line, end="", flush=True)
             logf.write(line)
+            if i % 200 == 0:
+                volume.commit()
         rc = proc.wait()
 
     manifest["ended_at"] = time.time()

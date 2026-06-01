@@ -45,10 +45,12 @@ eval_image = (
         "git clone --depth 1 https://github.com/WooooDyy/AgentGym /opt/agentgym",
         "cd /opt/agentgym/agentenv-babyai && pip install --no-deps -e .",
         "cd /opt/agentgym/agentenv-alfworld && pip install --no-deps -e .",
-        "alfworld-download -f",
         "git clone --depth 1 https://github.com/alfworld/alfworld.git /tmp/alfworld_repo",
         "mkdir -p /root/alfworld_data/configs",
         "cp /tmp/alfworld_repo/configs/base_config.yaml /root/alfworld_data/configs/base_config.yaml",
+        # ALFWORLD_DATA must be set at build time so alfworld-download writes to the
+        # same path that the runtime env var points to.
+        "ALFWORLD_DATA=/root/alfworld_data alfworld-download -f",
     )
     .env({
         "PYTHONPATH": "/root/project/src:/opt/verl",
@@ -67,8 +69,20 @@ volume = modal.Volume.from_name("cs224r-interface-rl", create_if_missing=True)
 
 # Eval always uses n=8 rollouts per task (avg@8).
 _N_ROLLOUTS = 8
-# Number of val tasks to evaluate (subset for speed; set to -1 for all).
-_N_VAL_TASKS = 60   # BabyAI: 20 tasks × 3 levels = 60; ALFWorld: use all 134
+_N_VAL_BABYAI = 50    # randomly sampled from 60 available
+_N_VAL_ALFWORLD = 80  # randomly sampled from 134 available
+
+
+def _subsample_parquet(src: str, n: int, seed: int, dst: str) -> str:
+    """Load parquet at src, randomly sample n rows, write to dst, return dst."""
+    import pandas as pd
+    df = pd.read_parquet(src)
+    if n >= len(df):
+        df.to_parquet(dst, index=False)
+    else:
+        df.sample(n=n, random_state=seed).reset_index(drop=True).to_parquet(dst, index=False)
+    print(f"subsampled {src}: {len(df)} → {min(n, len(df))} rows → {dst}")
+    return dst
 
 
 def _verl_eval_cmd(
@@ -131,10 +145,13 @@ def _verl_eval_cmd(
         "custom_reward_function.name=compute_score",
     ]
     if checkpoint_dir:
-        cmd += [
-            "trainer.resume_mode=auto",
-            f"trainer.resume_training_path={checkpoint_dir}",
+        # Point default_local_dir at the checkpoint so VERL's resume_mode=auto
+        # finds the weights there. save_freq=-1 so nothing new is written.
+        cmd = [
+            f"trainer.default_local_dir={checkpoint_dir}" if c.startswith("trainer.default_local_dir=") else c
+            for c in cmd
         ]
+        cmd += ["trainer.resume_mode=auto"]
     return cmd
 
 
@@ -145,13 +162,13 @@ def _verl_eval_cmd(
     timeout=7200,
     memory=131072,
 )
-def eval_held_in(checkpoint_dir: str | None = None, run_label: str = "base") -> dict:
+def eval_held_in(checkpoint_dir: str | None = None, run_label: str = "base", _val_parquet_override: str | None = None) -> dict:
     """Evaluate on BabyAI val set with full action list (held-in metric).
 
     Args:
-        checkpoint_dir: path to trained checkpoint on the Modal volume.
-                        None evaluates the base model.
-        run_label:      label for output files (e.g. "per_step", "examples", "curriculum").
+        checkpoint_dir:        path to trained checkpoint. None evaluates the base model.
+        run_label:             label for output files.
+        _val_parquet_override: if set, use this parquet directly instead of subsampling.
     """
     import json, os, subprocess, time
 
@@ -160,10 +177,19 @@ def eval_held_in(checkpoint_dir: str | None = None, run_label: str = "base") -> 
     log_path = f"/output/eval/{run_id}/stdout.log"
     os.makedirs(f"/output/eval/{run_id}", exist_ok=True)
 
+    if _val_parquet_override:
+        val_parquet = _val_parquet_override
+        print(f"using override parquet: {val_parquet}")
+    else:
+        val_parquet = _subsample_parquet(
+            "/output/data/babyai_phase1_v1/per_step/val.parquet",
+            n=_N_VAL_BABYAI, seed=42,
+            dst=f"/output/eval/{run_id}/val_subsample.parquet",
+        )
     cmd = _verl_eval_cmd(
         checkpoint_dir=checkpoint_dir,
         interaction_config_path="/root/project/src/babyai_rl/configs/interaction_config/babyai_interaction_per_step.yaml",
-        val_parquet="/output/data/babyai_v1/per_step/val.parquet",
+        val_parquet=val_parquet,
         run_id=run_id,
     )
 
@@ -203,10 +229,15 @@ def eval_held_out(checkpoint_dir: str | None = None, run_label: str = "base") ->
     log_path = f"/output/eval/{run_id}/stdout.log"
     os.makedirs(f"/output/eval/{run_id}", exist_ok=True)
 
+    val_parquet = _subsample_parquet(
+        "/output/data/alfworld_xi_prompt/val.parquet",
+        n=_N_VAL_ALFWORLD, seed=42,
+        dst=f"/output/eval/{run_id}/val_subsample.parquet",
+    )
     cmd = _verl_eval_cmd(
         checkpoint_dir=checkpoint_dir,
         interaction_config_path="/root/project/src/alfworld_rl/configs/interaction_config/alfworld_interaction_config.yaml",
-        val_parquet="/output/data/alfworld_xi_prompt/val.parquet",
+        val_parquet=val_parquet,
         run_id=run_id,
     )
 
@@ -221,6 +252,59 @@ def eval_held_out(checkpoint_dir: str | None = None, run_label: str = "base") ->
               "checkpoint_dir": checkpoint_dir, **metrics}
     with open(f"/output/eval/{run_id}/result.json", "w") as f:
         import json
+        json.dump(result, f, indent=2)
+    volume.commit()
+    return result
+
+
+@app.function(
+    image=eval_image,
+    gpu="H100:8",
+    volumes={"/output": volume},
+    timeout=7200,
+    memory=131072,
+)
+def eval_held_out_condA(checkpoint_dir: str | None = None, run_label: str = "base", subsample_seed: int = 42, full_list: bool = False) -> dict:
+    """Condition A: ALFWorld eval with full action list per turn (held-out).
+
+    Same parquet and system prompt as eval_held_out, but show_action_list_per_turn=True
+    so the model sees the admissible-actions list at every turn, not just at episode start.
+    Tests whether the 0.013 floor is a format-disambiguation failure rather than a
+    weight-level transfer failure.
+    """
+    import json, os, time
+
+    os.chdir("/opt/verl")
+    run_id = f"held_out_condA_{run_label}_{int(time.time())}"
+    log_path = f"/output/eval/{run_id}/stdout.log"
+    os.makedirs(f"/output/eval/{run_id}", exist_ok=True)
+
+    val_parquet = _subsample_parquet(
+        "/output/data/alfworld_xi_prompt/val.parquet",
+        n=_N_VAL_ALFWORLD, seed=subsample_seed,
+        dst=f"/output/eval/{run_id}/val_subsample.parquet",
+    )
+    interaction_yaml = (
+        "alfworld_interaction_perstep_fulllist.yaml" if full_list
+        else "alfworld_interaction_perstep.yaml"
+    )
+    cmd = _verl_eval_cmd(
+        checkpoint_dir=checkpoint_dir,
+        interaction_config_path=f"/root/project/src/alfworld_rl/configs/interaction_config/{interaction_yaml}",
+        val_parquet=val_parquet,
+        run_id=run_id,
+    )
+
+    print(f"=== eval held-out condA [{run_label}] (full_list={full_list}) ===")
+    if checkpoint_dir:
+        print(f"checkpoint: {checkpoint_dir}")
+    else:
+        print("evaluating base model (no checkpoint)")
+
+    metrics = _run_and_parse(cmd, log_path)
+    result = {"run_id": run_id, "split": "held_out_condA", "label": run_label,
+              "checkpoint_dir": checkpoint_dir, **metrics}
+    with open(f"/output/eval/{run_id}/result.json", "w") as f:
         json.dump(result, f, indent=2)
     volume.commit()
     return result
@@ -244,8 +328,10 @@ def _run_and_parse(cmd: list[str], log_path: str) -> dict:
         for line in proc.stdout:
             print(line, end="", flush=True)
             logf.write(line)
-            # VERL logs val metrics like: val/task_success: 0.85
-            m = re.search(r"val/task_success[:\s]+([0-9.]+)", line)
+            # VERL logs initial val metrics like:
+            # step:0 - val-core/babyai/acc/mean@1:0.255 - ...
+            # step:0 - val-core/alfworld/acc/mean@1:0.42 - ...
+            m = re.search(r"val-core/[^/]+/acc/mean@1:([0-9.]+)", line)
             if m:
                 success_rate = float(m.group(1))
         rc = proc.wait()
@@ -299,25 +385,153 @@ def eval_base():
     print(f"  out: {r_out}")
 
 
-@app.local_entrypoint()
-def eval_nolist(checkpoint_dir: str, run_label: str = "trained"):
-    """Optional within-environment experiment: evaluate WITHOUT action list at test time.
+@app.function(image=eval_image, timeout=300)
+def probe_alfworld_data() -> dict:
+    """CPU-only sanity check: load AlfredTWEnv and report game counts per split.
+    No GPU, no VERL — runs in ~60s to verify the ALFWorld download path is correct.
+    """
+    import yaml
+    from alfworld.agents.environment.alfred_tw_env import AlfredTWEnv
 
-    Tests whether a per_step-trained model collapses when the list is withheld.
-    Uses babyai_interaction_nolist_eval.yaml.
+    with open("/root/alfworld_data/configs/base_config.yaml") as f:
+        cfg = yaml.safe_load(f)
+
+    results = {}
+    for split in ("eval_out_of_distribution",):
+        env = AlfredTWEnv(cfg, train_eval=split)
+        n = len(env.game_files)
+        first = env.game_files[0] if env.game_files else "NONE"
+        print(f"split={split!r}: {n} games, first={first}")
+        results[split] = {"n_games": n, "first": first}
+    return results
+
+
+@app.local_entrypoint()
+def probe_alfworld():
+    """Quick CPU-only check that ALFWorld data loaded correctly.
 
     Usage:
-        modal run scripts/modal_eval.py::eval_nolist --checkpoint-dir /output/ckpts/<run_id>
+        modal run scripts/modal_eval.py::probe_alfworld
     """
-    import subprocess, os, json, time
+    r = probe_alfworld_data.remote()
+    print(r)
 
-    print(f"=== eval without list [{run_label}] ===")
 
-    # Reuse eval_held_in machinery but swap interaction config
-    # (inline here since it's a one-off optional experiment)
-    run_id = f"nolist_{run_label}_{int(time.time())}"
-    os.makedirs(f"/output/eval/{run_id}", exist_ok=True)
+@app.local_entrypoint()
+def eval_per_level(checkpoint_dir: str | None = None, run_label: str = "base"):
+    """Evaluate a checkpoint on GoToRedBall only (17 tasks × 8 rollouts).
 
-    h = eval_held_in.spawn(checkpoint_dir=checkpoint_dir, run_label=f"nolist_{run_label}")
+    Uses the pre-filtered parquet at data/val_gotoredball.parquet.
+
+    Usage:
+        modal run scripts/modal_eval.py::eval_per_level --checkpoint-dir /output/ckpts/<run_id> --run-label per_step
+        modal run scripts/modal_eval.py::eval_per_level  # base model
+    """
+    h = eval_held_in.spawn(
+        checkpoint_dir=checkpoint_dir,
+        run_label=f"gotoredball_{run_label}",
+        _val_parquet_override="/output/data/val_gotoredball.parquet",
+    )
     r = h.get()
+    print(f"\n=== GoToRedBall only [{run_label}] ===")
+    print(f"  success_rate: {r.get('success_rate')}")
     print(f"  result: {r}")
+
+
+@app.local_entrypoint()
+def eval_nolist(checkpoint_dir: str, run_label: str = "trained"):
+    """Alias: use modal_interp_eval.py for the no-list interpretability experiment.
+
+    This function is a stub. Run the interpretability eval with:
+        modal run scripts/modal_interp_eval.py --checkpoint-dir <path> --run-label <label>
+    """
+    print("eval_nolist has moved to scripts/modal_interp_eval.py")
+    print("Run: modal run scripts/modal_interp_eval.py \\")
+    print(f"       --checkpoint-dir {checkpoint_dir} --run-label {run_label}")
+
+
+@app.local_entrypoint()
+def eval_condA(run_label: str = "base", checkpoint_dir: str = "", subsample_seed: int = 42, full_list: bool = False):
+    """Run Condition A eval for a single checkpoint. Launch in separate terminal tabs for full visibility.
+
+    Usage:
+        # Base model
+        modal run scripts/modal_eval.py::eval_condA --run-label base
+
+        # per_step@300
+        modal run scripts/modal_eval.py::eval_condA \\
+            --run-label per_step_300 \\
+            --checkpoint-dir /output/ckpts/babyai_per_step_seed0_steps200_1779869791
+
+        # examples@300
+        modal run scripts/modal_eval.py::eval_condA \\
+            --run-label examples_300 \\
+            --checkpoint-dir /output/ckpts/babyai_examples_seed0_steps200_1779877838
+    """
+    ckpt = checkpoint_dir if checkpoint_dir else None
+    r = eval_held_out_condA.remote(checkpoint_dir=ckpt, run_label=run_label, subsample_seed=subsample_seed, full_list=full_list)
+    print(f"\n=== Condition A [{run_label}] (seed={subsample_seed}, full_list={full_list}) ===")
+    print(f"  success_rate: {r.get('success_rate')}")
+    print(f"  returncode:   {r.get('returncode')}")
+    print(f"  run_id:       {r.get('run_id')}")
+
+
+@app.local_entrypoint()
+def eval_condA_base():
+    """Condition A baseline: evaluate base model (no checkpoint) with per-turn action list.
+
+    Required data point for interpreting eval_condA_all results — without it you cannot
+    separate the effect of training from the effect of the format change itself.
+
+    Usage:
+        modal run scripts/modal_eval.py::eval_condA_base
+    """
+    r = eval_held_out_condA.remote(checkpoint_dir=None, run_label="base")
+    print("\n=== Condition A base model smoke result ===")
+    print(f"  success_rate: {r.get('success_rate')}")
+    print(f"  returncode:   {r.get('returncode')}")
+    print(f"  run_id:       {r.get('run_id')}")
+
+
+@app.local_entrypoint()
+def eval_condA_all(per_step_ckpt: str, examples_ckpt: str):
+    """Run Condition A eval (show_action_list_per_turn=True) for all three checkpoints in parallel.
+
+    Includes base model as a required baseline — needed to separate the effect of training
+    from the effect of the format change (per-turn action list) itself.
+
+    Usage:
+        modal run scripts/modal_eval.py::eval_condA_all \\
+            --per-step-ckpt ckpts/babyai_per_step_seed0_steps200_1779869791 \\
+            --examples-ckpt ckpts/babyai_examples_seed0_steps200_1779877838
+    """
+    h_base     = eval_held_out_condA.spawn(checkpoint_dir=None,          run_label="base")
+    h_perstep  = eval_held_out_condA.spawn(checkpoint_dir=per_step_ckpt, run_label="per_step_300")
+    h_examples = eval_held_out_condA.spawn(checkpoint_dir=examples_ckpt, run_label="examples_300")
+
+    r_base = h_base.get()
+    r_ps   = h_perstep.get()
+    r_ex   = h_examples.get()
+
+    print("\n=== Condition A results (show_action_list_per_turn=True) ===")
+    print(f"  base:          {r_base.get('success_rate')}")
+    print(f"  per_step@300:  {r_ps.get('success_rate')}")
+    print(f"  examples@300:  {r_ex.get('success_rate')}")
+    print("\n  (standard held-out for comparison: base=0.013, per_step=0.013, examples=0.013)")
+
+
+@app.local_entrypoint()
+def eval_condA_fulllist(run_label: str, seed: int, checkpoint_dir: str = ""):
+    """Condition A with FULL admissible-actions list (no 15-action cap). Use for rounds 2 and 3.
+
+    Usage:
+        modal run --detach scripts/modal_eval.py::eval_condA_fulllist --run-label base_rep2 --seed 43
+        modal run --detach scripts/modal_eval.py::eval_condA_fulllist --run-label per_step_rep2 --seed 43 --checkpoint-dir /output/ckpts/babyai_per_step_seed0_steps200_1779869791
+        modal run --detach scripts/modal_eval.py::eval_condA_fulllist --run-label examples_rep2 --seed 43 --checkpoint-dir /output/ckpts/babyai_examples_seed0_steps200_1779877838
+    """
+    ckpt = checkpoint_dir if checkpoint_dir else None
+    r = eval_held_out_condA.remote(checkpoint_dir=ckpt, run_label=run_label, subsample_seed=seed, full_list=True)
+    print(f"\n=== Condition A fulllist [{run_label}] (seed={seed}) ===")
+    print(f"  success_rate: {r.get('success_rate')}")
+    print(f"  returncode:   {r.get('returncode')}")
+    print(f"  run_id:       {r.get('run_id')}")

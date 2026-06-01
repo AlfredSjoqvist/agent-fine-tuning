@@ -169,12 +169,11 @@ def _build_split_rows(cfg, split: str, n_target: int, max_turns: int) -> list[di
     return rows
 
 
-@app.function(image=image, volumes={"/output": volume}, timeout=14400)
+@app.function(image=image, volumes={"/output": volume}, timeout=3600)
 def build_dataset(
-    n_train: int = 500,       # 500 train-split games (subsample of ~3,300 for speed)
     n_val: int = 134,         # 134 = all valid_unseen games
     max_turns: int = 30,
-    output_subdir: str = "alfworld_paper_faithful",
+    output_subdir: str = "alfworld_xi_prompt",
 ) -> dict:
     import os
 
@@ -184,38 +183,25 @@ def build_dataset(
     with open("/root/alfworld_data/configs/base_config.yaml") as f:
         cfg = yaml.safe_load(f)
 
-    print("\n=== Building TRAIN parquet from `train` split ===")
-    train_rows = _build_split_rows(cfg, split="train", n_target=n_train, max_turns=max_turns)
-
     print("\n=== Building VAL parquet from `eval_out_of_distribution` (valid_unseen) ===")
     val_rows = _build_split_rows(cfg, split="eval_out_of_distribution", n_target=n_val, max_turns=max_turns)
 
     out_dir = f"/output/data/{output_subdir}"
     os.makedirs(out_dir, exist_ok=True)
-    train_path = f"{out_dir}/train.parquet"
     val_path = f"{out_dir}/val.parquet"
-    pd.DataFrame(train_rows).to_parquet(train_path, index=False)
     pd.DataFrame(val_rows).to_parquet(val_path, index=False)
 
     volume.commit()
 
-    print(f"\nwrote {len(train_rows)} train rows -> {train_path}")
-    print(f"wrote {len(val_rows)} val rows -> {val_path}")
-    print("\nfirst 3 train task descriptions:")
-    for r in train_rows[:3]:
-        print(f"  - game_index={r['extra_info']['game_index']}: {r['extra_info']['task_desc']}")
+    print(f"\nwrote {len(val_rows)} val rows -> {val_path}")
 
     return {
-        "n_train": len(train_rows),
         "n_val": len(val_rows),
-        "train_path": train_path,
         "val_path": val_path,
     }
 
 
 @app.local_entrypoint()
 def main():
-    # alfworld_xi_prompt: stratified train (504 games) + full 134 val,
-    # using AgentGym's verbatim system prompt + observation format.
-    # Stratified order matches alfworld_interaction.py exactly (sampling.py, seed=42).
-    print(build_dataset.remote(n_train=-1, n_val=134, output_subdir="alfworld_xi_prompt"))
+    # Build only the val parquet — ALFWorld is a held-out eval env only, never trained on.
+    print(build_dataset.remote(n_val=134, output_subdir="alfworld_xi_prompt"))

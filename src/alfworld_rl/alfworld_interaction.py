@@ -146,11 +146,14 @@ class AlfworldInteraction(BaseInteraction):
         self.split = config.get("split", "eval_out_of_distribution")
         self.max_turns = int(config.get("max_turns", 15))
         self.show_action_list_per_turn = bool(config.get("show_action_list_per_turn", True))
+        raw_cap = config.get("max_action_list_per_turn", None)
+        self.max_action_list_per_turn: Optional[int] = int(raw_cap) if raw_cap is not None else None
         logger.warning(
-            "AlfworldInteraction init: max_turns=%d, split=%s, show_action_list_per_turn=%s, raw config keys=%s",
+            "AlfworldInteraction init: max_turns=%d, split=%s, show_action_list_per_turn=%s, max_action_list_per_turn=%s, raw config keys=%s",
             self.max_turns,
             self.split,
             self.show_action_list_per_turn,
+            self.max_action_list_per_turn,
             list(config.keys()),
         )
 
@@ -177,6 +180,12 @@ class AlfworldInteraction(BaseInteraction):
         if not hasattr(env, "_full_game_files"):
             env._full_game_files = list(env.game_files)
         n_games = len(env._full_game_files)
+        if n_games == 0:
+            raise RuntimeError(
+                f"AlfredTWEnv loaded 0 games for split={actual_split!r}. "
+                "Check that ALFWORLD_DATA points to the downloaded data and "
+                "that the split name matches the config (eval_out_of_distribution for valid_unseen)."
+            )
         target_idx = game_index % n_games
         target_game = env._full_game_files[target_idx]
 
@@ -269,9 +278,16 @@ class AlfworldInteraction(BaseInteraction):
                 state["task_success"],
             )
 
+        admissible_for_prompt = state["admissible"]
+        if self.max_action_list_per_turn is not None and len(admissible_for_prompt) > self.max_action_list_per_turn:
+            import random as _random
+            admissible_for_prompt = _random.Random(state["turn"]).sample(
+                admissible_for_prompt, self.max_action_list_per_turn
+            )
+
         next_prompt = _format_observation(
             state["obs"],
-            state["admissible"],
+            admissible_for_prompt,
             state["turn"],
             self.max_turns,
             show_action_list=self.show_action_list_per_turn,

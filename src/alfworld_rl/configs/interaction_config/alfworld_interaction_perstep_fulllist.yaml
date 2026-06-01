@@ -1,0 +1,8 @@
+interaction:
+  - name: "alfworld"
+    class_name: "alfworld_rl.alfworld_interaction.AlfworldInteraction"
+    config:
+      split: "eval_out_of_distribution"
+      max_turns: 30
+      show_action_list_per_turn: True
+      # max_action_list_per_turn not set — full admissible list shown every turn
